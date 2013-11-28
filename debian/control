@@ -1,0 +1,31 @@
+Source: numba
+Priority: optional
+Maintainer: Pietro Battiston <me@pietrobattiston.it>
+Build-Depends: debhelper (>= 8.0.0), cython, python-all, python-llvmmath, python-numpy
+Standards-Version: 3.9.5
+Section: libs
+Homepage: http://numba.pydata.org
+Vcs-Git: git://git.debian.org/collab-maint/numba.git
+#Vcs-Browser: http://git.debian.org/?p=collab-maint/numba.git;a=summary
+
+Package: python-numba
+Section: python
+Architecture: any
+Depends: ${misc:Depends}, python, python-numpy, llvm, libc6
+Description: NumPy-aware optimizing compiler for Python
+ Numba is an Open Source NumPy-aware optimizing compiler for Python
+ sponsored by Continuum Analytics, Inc.  It uses the
+ remarkable LLVM compiler infrastructure to compile Python syntax to
+ machine code.
+ .
+ It is aware of NumPy arrays as typed memory regions and so can speed-up
+ code using NumPy arrays.  Other, less well-typed code will be translated
+ to Python C-API calls effectively removing the "interpreter" but not removing
+ the dynamic indirection.
+ .
+ Numba is also not a tracing jit.  It *compiles* your code before it gets
+ run either using run-time type information or type information you provide
+ in the decorator.
+ .
+ Numba is a mechanism for producing machine code from Python syntax and typed
+ data structures such as those that exist in NumPy.
