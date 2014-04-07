@@ -1,11 +1,6 @@
-numba (0.12.2-1) unstable; urgency=medium
+numba (0.12.2-1) unstable; urgency=low
 
-  * Imported Upstream version 0.12.2
+  * Initial release  (Closes: #743877)
 
  -- Pietro Battiston <me@pietrobattiston.it>  Wed, 19 Mar 2014 17:24:16 +0100
 
-numba (0.11.0-1) unstable; urgency=low
-
-  * Initial release
-
- -- Pietro Battiston <me@pietrobattiston.it>  Thu, 28 Nov 2013 15:54:11 +0100
