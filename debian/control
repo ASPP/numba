@@ -6,7 +6,7 @@ Standards-Version: 3.9.5
 Section: libs
 Homepage: http://numba.pydata.org
 Vcs-Git: git://git.debian.org/collab-maint/numba.git
-#Vcs-Browser: http://git.debian.org/?p=collab-maint/numba.git;a=summary
+Vcs-Browser: http://git.debian.org/?p=collab-maint/numba.git;a=summary
 
 Package: python-numba
 Section: python
