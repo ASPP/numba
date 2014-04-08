@@ -1,7 +1,7 @@
 Source: numba
 Priority: optional
 Maintainer: Pietro Battiston <me@pietrobattiston.it>
-Build-Depends: debhelper (>= 8.0.0), cython, python-all, python-llvmmath, python-numpy
+Build-Depends: debhelper (>= 8.0.0), cython, python-all, python-llvm, python-llvmmath, python-numpy, dh-python, python-dev
 Standards-Version: 3.9.5
 Section: libs
 Homepage: http://numba.pydata.org
@@ -11,7 +11,7 @@ Vcs-Browser: http://git.debian.org/?p=collab-maint/numba.git;a=summary
 Package: python-numba
 Section: python
 Architecture: any
-Depends: ${misc:Depends}, ${shlibs:Depends}, python, python-numpy, python-llvm
+Depends: ${misc:Depends}, ${shlibs:Depends}, python, python-numpy, python-llvm, python-llvmmath
 Description: NumPy-aware optimizing compiler for Python
  Numba is an Open Source NumPy-aware optimizing compiler for Python
  sponsored by Continuum Analytics, Inc.  It uses the
