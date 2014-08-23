@@ -1,7 +1,7 @@
 Source: numba
 Priority: optional
 Maintainer: Pietro Battiston <me@pietrobattiston.it>
-Build-Depends: debhelper (>= 8.0.0), cython, python-all, python-llvm, python-llvmmath, python-numpy, dh-python, python-dev
+Build-Depends: debhelper (>= 8.0.0), cython, python-all, python-llvm, python-numpy, dh-python, python-dev
 Standards-Version: 3.9.5
 Section: libs
 Homepage: http://numba.pydata.org
