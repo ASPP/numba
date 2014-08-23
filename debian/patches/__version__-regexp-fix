@@ -1,0 +1,31 @@
+Description: Fix version regexp
+ .
+ numba (0.13.4-1) unstable; urgency=medium
+ .
+   * Latest upstream version.
+Author: Zbigniew Jędrzejewski-Szmek <zbyszek@in.waw.pl>
+
+---
+The information above should follow the Patch Tagging Guidelines, please
+checkout http://dep.debian.net/deps/dep3/ to learn about the format. Here
+are templates for supplementary fields that you might want to add:
+
+Origin: <vendor|upstream|other>, <url of original patch>
+Bug: <url in upstream bugtracker>
+Bug-Debian: http://bugs.debian.org/<bugnumber>
+Bug-Ubuntu: https://launchpad.net/bugs/<bugnumber>
+Forwarded: <no|not-needed|url proving that it has been forwarded>
+Reviewed-By: <name and email of someone who approved the patch>
+Last-Update: <YYYY-MM-DD>
+
+--- numba-0.13.4.orig/numba/__init__.py
++++ numba-0.13.4/numba/__init__.py
+@@ -53,7 +53,7 @@ def _sentry_llvm_version():
+ 
+     # Only look at the the major, minor and bugfix version numbers.
+     # Ignore other stuffs
+-    regex = re.compile(r'(\d+)\.(\d+).(\d+)')
++    regex = re.compile(r'(?:tag: )?(\d+)\.(\d+).(\d+)')
+     m = regex.match(llvm.__version__)
+     if m:
+         ver = tuple(map(int, m.groups()))
