@@ -11,7 +11,7 @@ Vcs-Browser: http://git.debian.org/?p=collab-maint/numba.git;a=summary
 Package: python-numba
 Section: python
 Architecture: any
-Depends: ${misc:Depends}, ${shlibs:Depends}, python, python-numpy, python-llvm, python-llvmmath
+Depends: ${misc:Depends}, ${shlibs:Depends}, python, python-numpy, python-llvm
 Description: NumPy-aware optimizing compiler for Python
  Numba is an Open Source NumPy-aware optimizing compiler for Python
  sponsored by Continuum Analytics, Inc.  It uses the
