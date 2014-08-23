@@ -2,17 +2,30 @@ from __future__ import print_function, division, absolute_import
 from pprint import pprint
 from contextlib import contextmanager
 from collections import namedtuple, defaultdict
+
 from numba import (bytecode, interpreter, typing, typeinfer, lowering,
-                   irpasses, utils, config, type_annotations, types, ir,
-                   assume, looplifting)
+                   objmode, irpasses, utils, config, type_annotations,
+                   types, ir, assume, looplifting, macro)
 from numba.targets import cpu
 
 
 class Flags(utils.ConfigOptions):
-    OPTIONS = frozenset(['enable_looplift',
-                         'enable_pyobject',
-                         'force_pyobject',
-                         'no_compile'])
+    # These options are all false by default, but the defaults are
+    # different with the @jit decorator (see targets.options.TargetOptions).
+
+    OPTIONS = frozenset([
+        # Enable loop-lifting
+        'enable_looplift',
+        # Enable pyobject mode (in general)
+        'enable_pyobject',
+        # Enable pyobject mode inside lifted loops
+        'enable_pyobject_looplift',
+        # Force pyobject mode inside the whole function
+        'force_pyobject',
+        'no_compile',
+        'no_wraparound',
+        'boundcheck',
+        ])
 
 
 DEFAULT_FLAGS = Flags()
@@ -21,14 +34,14 @@ DEFAULT_FLAGS = Flags()
 CR_FIELDS = ["typing_context",
              "target_context",
              "entry_point",
-             "entry_point_addr",
              "typing_error",
              "type_annotation",
              "llvm_module",
              "llvm_func",
              "signature",
              "objectmode",
-             "lifted",]
+             "lifted",
+             "fndesc"]
 
 
 CompileResult = namedtuple("CompileResult", CR_FIELDS)
@@ -72,6 +85,9 @@ def _fallback_context(status):
     except Exception as e:
         if not status.can_fallback:
             raise
+        if utils.PYVERSION >= (3,):
+            # Clear all references attached to the traceback
+            e = e.with_traceback(None)
         status.fail_reason = e
         status.use_python_mode = True
 
@@ -85,7 +101,7 @@ def compile_extra(typingctx, targetctx, func, args, return_type, flags,
         Use ``None`` to indicate
     """
     bc = bytecode.ByteCode(func=func)
-    if config.DEBUG:
+    if config.DUMP_BYTECODE:
         print(bc.dump())
     return compile_bytecode(typingctx, targetctx, bc, args,
                             return_type, flags, locals)
@@ -103,11 +119,12 @@ def compile_bytecode(typingctx, targetctx, bc, args, return_type, flags,
     status.fail_reason = None
     status.use_python_mode = flags.force_pyobject
 
-    localctx = targetctx.localized()
+    targetctx = targetctx.localized()
+    targetctx.metadata['wraparound'] = not flags.no_wraparound
 
     if not status.use_python_mode:
         with _fallback_context(status):
-            legialize_given_types(args, return_type)
+            legalize_given_types(args, return_type)
             # Type inference
             typemap, return_type, calltypes = type_inference_stage(typingctx,
                                                                    interp,
@@ -117,31 +134,37 @@ def compile_bytecode(typingctx, targetctx, bc, args, return_type, flags,
 
         if not status.use_python_mode:
             with _fallback_context(status):
-                legalize_return_type(return_type, interp, localctx)
+                legalize_return_type(return_type, interp, targetctx)
 
     if status.use_python_mode and flags.enable_looplift:
         assert not lifted
+
         # Try loop lifting
-        entry, loops = looplifting.lift_loop(bc)
-        if not loops:
-            # No extracted loops
-            pass
-        else:
-            loopflags = flags.copy()
-            # Do not recursively loop lift
-            loopflags.unset('enable_looplift')
-            loopdisp = looplifting.bind(loops, typingctx, targetctx, locals,
-                                        loopflags)
-            lifted = tuple(loopdisp)
+        loop_flags = flags.copy()
+        outer_flags = flags.copy()
+        # Do not recursively loop lift
+        outer_flags.unset('enable_looplift')
+        loop_flags.unset('enable_looplift')
+        if not flags.enable_pyobject_looplift:
+            loop_flags.unset('enable_pyobject')
+
+        def dispatcher_factory(loopbc):
+            from . import dispatcher
+            return dispatcher.LiftedLoop(loopbc, typingctx, targetctx,
+                                         locals, loop_flags)
+
+        entry, loops = looplifting.lift_loop(bc, dispatcher_factory)
+        if loops:
+            # Some loops were extracted
             cres = compile_bytecode(typingctx, targetctx, entry, args,
-                                    return_type, loopflags, locals,
-                                    lifted=lifted)
-            return cres._replace(lifted=lifted)
+                                    return_type, outer_flags, locals,
+                                    lifted=tuple(loops))
+            return cres
 
     if status.use_python_mode:
         # Object mode compilation
-        func, fnptr, lmod, lfunc = py_lowering_stage(localctx, interp,
-                                                     flags.no_compile)
+        func, lmod, lfunc, fndesc = py_lowering_stage(targetctx, interp,
+                                                             flags.no_compile)
         typemap = defaultdict(lambda: types.pyobject)
         calltypes = defaultdict(lambda: types.pyobject)
 
@@ -152,11 +175,12 @@ def compile_bytecode(typingctx, targetctx, bc, args, return_type, flags,
             args = tuple(args) + (types.pyobject,) * (nargs - len(args))
     else:
         # Native mode compilation
-        func, fnptr, lmod, lfunc = native_lowering_stage(localctx, interp,
-                                                         typemap,
-                                                         return_type,
-                                                         calltypes,
-                                                         flags.no_compile)
+        func, lmod, lfunc, fndesc = native_lowering_stage(targetctx,
+                                                                 interp,
+                                                                 typemap,
+                                                                 return_type,
+                                                                 calltypes,
+                                                                 flags.no_compile)
 
     type_annotation = type_annotations.TypeAnnotation(interp=interp,
                                                       typemap=typemap,
@@ -173,14 +197,14 @@ def compile_bytecode(typingctx, targetctx, bc, args, return_type, flags,
     cr = compile_result(typing_context=typingctx,
                         target_context=targetctx,
                         entry_point=func,
-                        entry_point_addr=fnptr,
                         typing_error=status.fail_reason,
                         type_annotation=type_annotation,
                         llvm_func=lfunc,
                         llvm_module=lmod,
                         signature=signature,
                         objectmode=status.use_python_mode,
-                        lifted=lifted,)
+                        lifted=lifted,
+                        fndesc=fndesc,)
     return cr
 
 
@@ -188,7 +212,7 @@ def _is_nopython_types(t):
     return t != types.pyobject and not isinstance(t, types.Dummy)
 
 
-def legialize_given_types(args, return_type):
+def legalize_given_types(args, return_type):
     # Filter argument types
     for i, a in enumerate(args):
         if not _is_nopython_types(a):
@@ -222,17 +246,25 @@ def legalize_return_type(return_type, interp, targetctx):
     # FIXME: In the future, we can return an array that is either a dynamically
     #        allocated array or an array that is passed as argument.  This
     #        must be statically resolvable.
+
+    # The return value must be the first modification of the value.
+    arguments = frozenset("%s.1" % arg for arg in interp.argspec.args)
+
     for ret in retstmts:
-        if ret.value.name not in interp.argspec.args:
-            raise ValueError("Only accept returning of array passed into the "
-                              "function as argument")
+        if ret.value.name not in arguments:
+            raise TypeError("Only accept returning of array passed into the "
+                            "function as argument")
 
     # Legalized; tag return handling
-    targetctx.metdata['return.array'] = 'arg'
+    targetctx.metadata['return.array'] = 'arg'
 
 
 def translate_stage(bytecode):
     interp = interpreter.Interpreter(bytecode=bytecode)
+
+    if config.DUMP_CFG:
+        interp.cfa.dump()
+
     interp.interpret()
 
     if config.DEBUG:
@@ -241,6 +273,13 @@ def translate_stage(bytecode):
             print(syn)
 
     interp.verify()
+    macro.expand_macros(interp.blocks)
+
+    if config.DUMP_IR:
+        interp.dump()
+        for syn in interp.syntax_info:
+            print(syn)
+
     return interp
 
 
@@ -252,7 +291,7 @@ def type_inference_stage(typingctx, interp, args, return_type, locals={}):
 
     # Seed argument types
     for arg, ty in zip(interp.argspec.args, args):
-        infer.seed_type(arg, ty)
+    	infer.seed_type(arg, ty)
 
     # Seed return type
     if return_type is not None:
@@ -277,35 +316,33 @@ def type_inference_stage(typingctx, interp, args, return_type, locals={}):
 def native_lowering_stage(targetctx, interp, typemap, restype, calltypes,
                           nocompile):
     # Lowering
-    fndesc = lowering.describe_function(interp, typemap, restype, calltypes)
+    fndesc = lowering.PythonFunctionDescriptor.from_specialized_function(
+        interp, typemap, restype, calltypes, mangler=targetctx.mangler)
 
     lower = lowering.Lower(targetctx, fndesc)
     lower.lower()
 
     if nocompile:
-        return None, 0, lower.module, lower.function
+        return None, lower.module, lower.function, fndesc
     else:
         # Prepare for execution
-        cfunc, fnptr = targetctx.get_executable(lower.function, fndesc)
+        cfunc = targetctx.get_executable(lower.function, fndesc, lower.env)
 
         targetctx.insert_user_function(cfunc, fndesc)
 
-        return cfunc, fnptr, lower.module, lower.function
+        return cfunc, lower.module, lower.function, fndesc
 
 
 def py_lowering_stage(targetctx, interp, nocompile):
-    # Optimize for python code
-    ir_optimize_for_py_stage(interp)
-
-    fndesc = lowering.describe_pyfunction(interp)
-    lower = lowering.PyLower(targetctx, fndesc)
+    fndesc = lowering.PythonFunctionDescriptor.from_object_mode_function(interp)
+    lower = objmode.PyLower(targetctx, fndesc)
     lower.lower()
 
     if nocompile:
-        return None, 0, lower.module, lower.function
+        return None, lower.module, lower.function, fndesc
     else:
-        cfunc, fnptr = targetctx.get_executable(lower.function, fndesc)
-        return cfunc, fnptr, lower.module, lower.function
+        cfunc = targetctx.get_executable(lower.function, fndesc, lower.env)
+        return cfunc, lower.module, lower.function, fndesc
 
 
 def ir_optimize_for_py_stage(interp):

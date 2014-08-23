@@ -13,16 +13,14 @@ Constrains push types forward following the dataflow.
 """
 
 from __future__ import print_function, division, absolute_import
-try:
-    import __builtin__ as builtins
-except ImportError:
-    import builtins
 
 from pprint import pprint
 import itertools
+
 from numba import ir, types, utils, config, ctypes_utils, cffi_support
 from numba.config import PYVERSION
 from numba import numpy_support
+from numba.utils import builtins
 
 RANGE_ITER_OBJECTS = (builtins.range,)
 if PYVERSION < (3, 0):
@@ -66,8 +64,14 @@ class TypeVar(object):
         assert nbefore <= nafter, "Must grow monotonically"
 
     def lock(self, typ):
-        self.typeset = set([typ])
-        self.locked = True
+        if self.locked:
+            [expect] = list(self.typeset)
+            if self.context.type_compatibility(typ, expect) is None:
+                raise TypingError("No conversion from %s to %s for "
+                                  "'%s'" % (typ, expect, self.var))
+        else:
+            self.typeset = set([typ])
+            self.locked = True
 
     def union(self, other):
         self.add_types(*other.typeset)
@@ -137,6 +141,69 @@ class BuildTupleConstrain(object):
             else:
                 tup = types.Tuple(vals)
             oset.add_types(tup)
+
+
+class ExhaustIterConstrain(object):
+    def __init__(self, target, count, iterator, loc):
+        self.target = target
+        self.count = count
+        self.iterator = iterator
+        self.loc = loc
+
+    def __call__(self, context, typevars):
+        oset = typevars[self.target]
+        for tp in typevars[self.iterator.name].get():
+            if isinstance(tp, types.IterableType):
+                oset.add_types(types.UniTuple(dtype=tp.iterator_type.yield_type,
+                                              count=self.count))
+            elif isinstance(tp, types.Tuple):
+                oset.add_types(tp)
+
+
+class PairFirstConstrain(object):
+    def __init__(self, target, pair, loc):
+        self.target = target
+        self.pair = pair
+        self.loc = loc
+
+    def __call__(self, context, typevars):
+        oset = typevars[self.target]
+        for tp in typevars[self.pair.name].get():
+            if not isinstance(tp, types.Pair):
+                # XXX is this an error?
+                continue
+            oset.add_types(tp.first_type)
+
+
+class PairSecondConstrain(object):
+    def __init__(self, target, pair, loc):
+        self.target = target
+        self.pair = pair
+        self.loc = loc
+
+    def __call__(self, context, typevars):
+        oset = typevars[self.target]
+        for tp in typevars[self.pair.name].get():
+            if not isinstance(tp, types.Pair):
+                # XXX is this an error?
+                continue
+            oset.add_types(tp.second_type)
+
+
+class StaticGetItemConstrain(object):
+    def __init__(self, target, value, index, loc):
+        self.target = target
+        self.value = value
+        self.index = index
+        self.loc = loc
+
+    def __call__(self, context, typevars):
+        oset = typevars[self.target]
+        for tp in typevars[self.value.name].get():
+            if isinstance(tp, types.UniTuple):
+                oset.add_types(tp.dtype)
+            elif isinstance(tp, types.Tuple):
+                oset.add_types(tp.types[self.index])
 
 
 class CallConstrain(object):
@@ -215,6 +282,24 @@ class SetItemConstrain(object):
                                   (ty, it, vt), loc=self.loc)
 
 
+class SetAttrConstrain(object):
+    def __init__(self, target, attr, value, loc):
+        self.target = target
+        self.attr = attr
+        self.value = value
+        self.loc = loc
+
+    def __call__(self, context, typevars):
+        targettys = typevars[self.target.name].get()
+        valtys = typevars[self.value.name].get()
+
+        for ty, vt in itertools.product(targettys, valtys):
+            if not context.resolve_setattr(target=ty, attr=self.attr,
+                                           value=vt):
+                raise TypingError("Cannot resolve setattr: (%s).%s = %s" %
+                                  (ty, self.attr, vt), loc=self.loc)
+
+
 class TypeVarMap(dict):
     def set_context(self, context):
         self.context = context
@@ -250,6 +335,7 @@ class TypeInferer(object):
         self.usercalls = []
         self.intrcalls = []
         self.setitemcalls = []
+        self.setattrcalls = []
 
     def dump(self):
         print('---- type variables ----')
@@ -263,12 +349,10 @@ class TypeInferer(object):
     def seed_return(self, typ):
         """Seeding of return value is optional.
         """
-        # self.return_type = typ
         for blk in utils.dict_itervalues(self.blocks):
             inst = blk.terminator
             if isinstance(inst, ir.Return):
                 self.typevars[inst.value.name].lock(typ)
-                # self.typevars[inst.value.name].lock()
 
     def build_constrain(self):
         for blk in utils.dict_itervalues(self.blocks):
@@ -280,7 +364,7 @@ class TypeInferer(object):
         oldtoken = None
         if config.DEBUG:
             self.dump()
-        # Since the number of types are finite, the typesets will eventually
+            # Since the number of types are finite, the typesets will eventually
         # stop growing.
         while newtoken != oldtoken:
             if config.DEBUG:
@@ -310,7 +394,7 @@ class TypeInferer(object):
     def get_function_types(self, typemap):
         calltypes = utils.UniqueDict()
         for call, args, kws in self.intrcalls:
-            if call.op in ('binop', 'unary'):
+            if call.op in ('inplace_binop', 'binop', 'unary'):
                 fnty = call.fn
             else:
                 fnty = call.op
@@ -321,11 +405,15 @@ class TypeInferer(object):
             calltypes[call] = signature
 
         for call, args, kws in self.usercalls:
-            fnty = typemap[call.func.name]
             args = tuple(typemap[a.name] for a in args)
-            assert not kws
-            signature = self.context.resolve_function_type(fnty, args, ())
-            assert signature is not None, (fnty, args)
+
+            if isinstance(call.func, ir.Intrinsic):
+                signature = call.func.type
+            else:
+                assert not kws
+                fnty = typemap[call.func.name]
+                signature = self.context.resolve_function_type(fnty, args, ())
+                assert signature is not None, (fnty, args)
             calltypes[call] = signature
 
         for inst in self.setitemcalls:
@@ -333,6 +421,13 @@ class TypeInferer(object):
             index = typemap[inst.index.name]
             value = typemap[inst.value.name]
             signature = self.context.resolve_setitem(target, index, value)
+            calltypes[inst] = signature
+
+        for inst in self.setattrcalls:
+            target = typemap[inst.target.name]
+            attr = inst.attr
+            value = typemap[inst.value.name]
+            signature = self.context.resolve_setattr(target, attr, value)
             calltypes[inst] = signature
 
         return calltypes
@@ -352,9 +447,11 @@ class TypeInferer(object):
                 return types.Optional(unified)
             else:
                 return types.none
-        else:
+        elif rettypes:
             unified = self.context.unify_types(*rettypes)
             return unified
+        else:
+            return types.none
 
     def get_state_token(self):
         """The algorithm is monotonic.  It can only grow the typesets.
@@ -368,7 +465,11 @@ class TypeInferer(object):
             self.typeof_assign(inst)
         elif isinstance(inst, ir.SetItem):
             self.typeof_setitem(inst)
+        elif isinstance(inst, ir.SetAttr):
+            self.typeof_setattr(inst)
         elif isinstance(inst, (ir.Jump, ir.Branch, ir.Return, ir.Del)):
+            pass
+        elif isinstance(inst, ir.Raise):
             pass
         else:
             raise NotImplementedError(inst)
@@ -379,6 +480,12 @@ class TypeInferer(object):
         self.constrains.append(constrain)
         self.setitemcalls.append(inst)
 
+    def typeof_setattr(self, inst):
+        constrain = SetAttrConstrain(target=inst.target, attr=inst.attr,
+                                     value=inst.value, loc=inst.loc)
+        self.constrains.append(constrain)
+        self.setattrcalls.append(inst)
+
     def typeof_assign(self, inst):
         value = inst.value
         if isinstance(value, ir.Const):
@@ -386,106 +493,94 @@ class TypeInferer(object):
         elif isinstance(value, ir.Var):
             self.constrains.append(Propagate(dst=inst.target.name,
                                              src=value.name, loc=inst.loc))
-        elif isinstance(value, ir.Global):
+        elif isinstance(value, (ir.Global, ir.FreeVar)):
             self.typeof_global(inst, inst.target, value)
         elif isinstance(value, ir.Expr):
             self.typeof_expr(inst, inst.target, value)
         else:
             raise NotImplementedError(type(value), value)
 
-    def typeof_const(self, inst, target, const):
-        if const is True or const is False:
-            self.typevars[target.name].lock(types.boolean)
-        elif isinstance(const, (int, float)):
-            ty = self.context.get_number_type(const)
-            self.typevars[target.name].lock(ty)
-        elif const is None:
-            self.typevars[target.name].lock(types.none)
-        # elif isinstance(const, str):
-        #     self.typevars[target.name].lock(types.string)
-        elif isinstance(const, complex):
-            self.typevars[target.name].lock(types.complex128)
-        elif isinstance(const, tuple):
-            tys = []
-            for elem in const:
-                if isinstance(elem, int):
-                    tys.append(types.intp)
-
-            if all(t == types.intp for t in tys):
-                typ = types.UniTuple(types.intp, len(tys))
-            else:
-                typ = types.Tuple(tys)
-            self.typevars[target.name].lock(typ)
-        else:
-            msg = "Unknown constant of type %s" % (const,)
+    def resolve_value_type(self, inst, val):
+        """
+        Resolve the type of a simple Python value, such as can be
+        represented by literals.
+        """
+        ty = self.context.resolve_value_type(val)
+        if ty is None:
+            msg = "Unsupported Python value %r" % (val,)
             raise TypingError(msg, loc=inst.loc)
+        else:
+            return ty
+
+    def typeof_const(self, inst, target, const):
+        self.typevars[target.name].lock(self.resolve_value_type(inst, const))
+
+    def sentry_modified_builtin(self, inst, gvar):
+        """Ensure that builtins are modified.
+        """
+        if (gvar.name in ('range', 'xrange') and
+                    gvar.value not in utils.RANGE_ITER_OBJECTS):
+            bad = True
+        elif gvar.name == 'slice' and gvar.value is not slice:
+            bad = True
+        elif gvar.name == 'len' and gvar.value is not len:
+            bad = True
+        else:
+            bad = False
+
+        if bad:
+            raise TypingError("Modified builtin '%s'" % gvar.name,
+                              loc=inst.loc)
 
     def typeof_global(self, inst, target, gvar):
-        if (gvar.name in ('range', 'xrange') and
-                    gvar.value in RANGE_ITER_OBJECTS):
-            gvty = self.context.get_global_type(gvar.value)
-            self.typevars[target.name].lock(gvty)
-            self.assumed_immutables.add(inst)
-        if gvar.name == 'slice' and gvar.value is slice:
-            gvty = self.context.get_global_type(gvar.value)
-            self.typevars[target.name].lock(gvty)
-            self.assumed_immutables.add(inst)
-        elif gvar.name == 'len' and gvar.value is len:
-            gvty = self.context.get_global_type(gvar.value)
-            self.typevars[target.name].lock(gvty)
-            self.assumed_immutables.add(inst)
-        elif gvar.name in ('True', 'False'):
-            assert gvar.value in (True, False)
-            self.typevars[target.name].lock(types.boolean)
-            self.assumed_immutables.add(inst)
-        elif isinstance(gvar.value, (int, float)):
-            gvty = self.context.get_number_type(gvar.value)
-            self.typevars[target.name].lock(gvty)
-            self.assumed_immutables.add(inst)
-        elif numpy_support.is_arrayscalar(gvar.value):
-            gvty = numpy_support.map_arrayscalar_type(gvar.value)
-            self.typevars[target.name].lock(gvty)
-            self.assumed_immutables.add(inst)
-        elif numpy_support.is_array(gvar.value):
-            ary = gvar.value
-            dtype = numpy_support.from_dtype(ary.dtype)
-            # force C contiguous
-            gvty = types.Array(dtype, ary.ndim, 'C')
-            self.typevars[target.name].lock(gvty)
-            self.assumed_immutables.add(inst)
-        elif ctypes_utils.is_ctypes_funcptr(gvar.value):
-            cfnptr = gvar.value
-            fnty = ctypes_utils.make_function_type(cfnptr)
-            self.typevars[target.name].lock(fnty)
-            self.assumed_immutables.add(inst)
-        elif cffi_support.SUPPORTED and cffi_support.is_cffi_func(gvar.value):
-            fnty = cffi_support.make_function_type(gvar.value)
-            self.typevars[target.name].lock(fnty)
+        typ = self.context.resolve_value_type(gvar.value)
+        if typ is not None:
+            self.sentry_modified_builtin(inst, gvar)
+            self.typevars[target.name].lock(typ)
             self.assumed_immutables.add(inst)
         else:
-            try:
-                gvty = self.context.get_global_type(gvar.value)
-            except KeyError:
-                raise TypingError("Untyped global name '%s'" % gvar.name,
-                                  loc=inst.loc)
-            self.assumed_immutables.add(inst)
-            self.typevars[target.name].lock(gvty)
-
-        # TODO Hmmm...
-        # elif gvar.value is ir.UNDEFINED:
-        #     self.typevars[target.name].add_types(types.pyobject)
+            raise TypingError("Untyped global name '%s'" % gvar.name,
+                              loc=inst.loc)
 
     def typeof_expr(self, inst, target, expr):
         if expr.op == 'call':
-            self.typeof_call(inst, target, expr)
-        elif expr.op in ('getiter', 'iternext', 'iternextsafe', 'itervalid'):
+            if isinstance(expr.func, ir.Intrinsic):
+                restype = expr.func.type.return_type
+                self.typevars[target.name].add_types(restype)
+                self.usercalls.append((inst.value, expr.args, expr.kws))
+            else:
+                self.typeof_call(inst, target, expr)
+        elif expr.op in ('getiter', 'iternext'):
             self.typeof_intrinsic_call(inst, target, expr.op, expr.value)
+        elif expr.op == 'exhaust_iter':
+            constrain = ExhaustIterConstrain(target.name, count=expr.count,
+                                             iterator=expr.value,
+                                             loc=expr.loc)
+            self.constrains.append(constrain)
+        elif expr.op == 'pair_first':
+            constrain = PairFirstConstrain(target.name, pair=expr.value,
+                                           loc=expr.loc)
+            self.constrains.append(constrain)
+        elif expr.op == 'pair_second':
+            constrain = PairSecondConstrain(target.name, pair=expr.value,
+                                            loc=expr.loc)
+            self.constrains.append(constrain)
         elif expr.op == 'binop':
+            self.typeof_intrinsic_call(inst, target, expr.fn, expr.lhs, expr.rhs)
+        elif expr.op == 'inplace_binop':
+            # We assume type constraints for inplace operators to be the
+            # same as for normal operators.  This may have to be refined in
+            # the future.
             self.typeof_intrinsic_call(inst, target, expr.fn, expr.lhs, expr.rhs)
         elif expr.op == 'unary':
             self.typeof_intrinsic_call(inst, target, expr.fn, expr.value)
+        elif expr.op == 'static_getitem':
+            constrain = StaticGetItemConstrain(target.name, value=expr.value,
+                                               index=expr.index,
+                                               loc=expr.loc)
+            self.constrains.append(constrain)
         elif expr.op == 'getitem':
-            self.typeof_intrinsic_call(inst, target, expr.op, expr.target,
+            self.typeof_intrinsic_call(inst, target, expr.op, expr.value,
                                        expr.index)
         elif expr.op == 'getattr':
             constrain = GetAttrConstrain(target.name, attr=expr.attr,

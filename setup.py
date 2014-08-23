@@ -1,6 +1,8 @@
 from distutils.core import setup, Extension
+import sys
 import os
 import numpy
+import numpy.distutils.misc_util as np_misc
 import versioneer
 
 versioneer.versionfile_source = 'numba/_version.py'
@@ -21,6 +23,14 @@ if os.environ.get("NUMBA_GCC_FLAGS"):
 else:
     CFLAGS = []
 
+
+if sys.platform == 'darwin' and sys.version_info[:2] == (2, 6):
+    cpp_link_args = ['-lstdc++']
+else:
+    cpp_link_args = []
+
+npymath_info = np_misc.get_info('npymath')
+
 ext_dynfunc = Extension(name='numba._dynfunc', sources=['numba/_dynfunc.c'],
                         extra_compile_args=CFLAGS,
                         depends=["numba/_pymodule.h"])
@@ -31,15 +41,25 @@ ext_numpyadapt = Extension(name='numba._numpyadapt',
                            extra_compile_args=CFLAGS,
                            depends=["numba/_pymodule.h"])
 
+ext_npymath_exports = Extension(name='numba._npymath_exports',
+                                sources=['numba/_npymath_exports.c'],
+                                include_dirs=npymath_info['include_dirs'],
+                                libraries=npymath_info['libraries'],
+                                library_dirs=npymath_info['library_dirs'],
+                                define_macros=npymath_info['define_macros'])
+
+
 ext_dispatcher = Extension(name="numba._dispatcher",
                            include_dirs=[numpy.get_include()],
                            sources=['numba/_dispatcher.c',
                                     'numba/_dispatcherimpl.cpp',
                                     'numba/typeconv/typeconv.cpp'],
                            depends=["numba/_pymodule.h",
-                                    "numba/_dispatcher.h"])
+                                    "numba/_dispatcher.h"],
+                           extra_link_args=cpp_link_args)
 
 ext_helperlib = Extension(name="numba._helperlib",
+                          include_dirs=[numpy.get_include()],
                           sources=["numba/_helperlib.c", "numba/_math_c99.c"],
                           extra_compile_args=CFLAGS,
                           depends=["numba/_pymodule.h",
@@ -49,7 +69,8 @@ ext_helperlib = Extension(name="numba._helperlib",
 ext_typeconv = Extension(name="numba.typeconv._typeconv",
                          sources=["numba/typeconv/typeconv.cpp",
                                   "numba/typeconv/_typeconv.cpp"],
-                         depends=["numba/_pymodule.h"])
+                         depends=["numba/_pymodule.h"],
+                         extra_link_args=cpp_link_args)
 
 ext_npyufunc_ufunc = Extension(name="numba.npyufunc._internal",
                                sources=["numba/npyufunc/_internal.c"],
@@ -57,9 +78,11 @@ ext_npyufunc_ufunc = Extension(name="numba.npyufunc._internal",
                                depends=["numba/npyufunc/_internal.h",
                                         "numba/_pymodule.h"])
 
+ext_mviewbuf = Extension(name='numba.mviewbuf',
+                         sources=['numba/mviewbuf.c'])
 
-ext_modules = [ext_dynfunc, ext_numpyadapt, ext_dispatcher, ext_helperlib,
-               ext_typeconv, ext_npyufunc_ufunc]
+ext_modules = [ext_dynfunc, ext_numpyadapt, ext_npymath_exports, ext_dispatcher,
+               ext_helperlib, ext_typeconv, ext_npyufunc_ufunc, ext_mviewbuf]
 
 packages = [
     "numba",
@@ -69,6 +92,12 @@ packages = [
     "numba.typeconv",
     "numba.npyufunc",
     "numba.pycc",
+    "numba.servicelib",
+    "numba.cuda",
+    "numba.cuda.cudadrv",
+    "numba.cuda.tests",
+    "numba.cuda.tests.cudadrv",
+    "numba.cuda.tests.cudapy",
 ]
 
 setup(name='numba',

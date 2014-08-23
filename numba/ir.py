@@ -99,6 +99,11 @@ class Expr(object):
         return cls(op=op, loc=loc, fn=fn, lhs=lhs, rhs=rhs)
 
     @classmethod
+    def inplace_binop(cls, fn, lhs, rhs, loc):
+        op = 'inplace_binop'
+        return cls(op=op, loc=loc, fn=fn, lhs=lhs, rhs=rhs)
+
+    @classmethod
     def unary(cls, fn, value, loc):
         op = 'unary'
         return cls(op=op, loc=loc, fn=fn, value=value)
@@ -119,6 +124,26 @@ class Expr(object):
         return cls(op=op, loc=loc, items=items)
 
     @classmethod
+    def build_set(cls, items, loc):
+        op = 'build_set'
+        return cls(op=op, loc=loc, items=items)
+
+    @classmethod
+    def build_map(cls, size, loc):
+        op = 'build_map'
+        return cls(op=op, loc=loc, size=size)
+
+    @classmethod
+    def pair_first(cls, value, loc):
+        op = 'pair_first'
+        return cls(op=op, loc=loc, value=value)
+
+    @classmethod
+    def pair_second(cls, value, loc):
+        op = 'pair_second'
+        return cls(op=op, loc=loc, value=value)
+
+    @classmethod
     def getiter(cls, value, loc):
         op = 'getiter'
         return cls(op=op, loc=loc, value=value)
@@ -129,14 +154,9 @@ class Expr(object):
         return cls(op=op, loc=loc, value=value)
 
     @classmethod
-    def iternextsafe(cls, value, loc):
-        op = 'iternextsafe'
-        return cls(op=op, loc=loc, value=value)
-
-    @classmethod
-    def itervalid(cls, value, loc):
-        op = 'itervalid'
-        return cls(op=op, loc=loc, value=value)
+    def exhaust_iter(cls, value, count, loc):
+        op = 'exhaust_iter'
+        return cls(op=op, loc=loc, value=value, count=count)
 
     @classmethod
     def getattr(cls, value, attr, loc):
@@ -144,9 +164,14 @@ class Expr(object):
         return cls(op=op, loc=loc, value=value, attr=attr)
 
     @classmethod
-    def getitem(cls, target, index, loc):
+    def getitem(cls, value, index, loc):
         op = 'getitem'
-        return cls(op=op, loc=loc, target=target, index=index)
+        return cls(op=op, loc=loc, value=value, index=index)
+
+    @classmethod
+    def static_getitem(cls, value, index, loc):
+        op = 'static_getitem'
+        return cls(op=op, loc=loc, value=value, index=index)
 
     def __repr__(self):
         if self.op == 'call':
@@ -176,6 +201,38 @@ class SetItem(Stmt):
         return '%s[%s] = %s' % (self.target, self.index, self.value)
 
 
+class SetAttr(Stmt):
+    def __init__(self, target, attr, value, loc):
+        self.target = target
+        self.attr = attr
+        self.value = value
+        self.loc = loc
+
+    def __repr__(self):
+        return '(%s).%s = %s' % (self.target, self.attr, self.value)
+
+
+class DelAttr(Stmt):
+    def __init__(self, target, attr, loc):
+        self.target = target
+        self.attr = attr
+        self.loc = loc
+
+    def __repr__(self):
+        return 'del (%s).%s' % (self.target, self.attr)
+
+
+class StoreMap(Stmt):
+    def __init__(self, dct, key, value, loc):
+        self.dct = dct
+        self.key = key
+        self.value = value
+        self.loc = loc
+
+    def __repr__(self):
+        return '%s[%s] = %s' % (self.dct, self.key, self.value)
+
+
 class Del(Stmt):
     def __init__(self, value, loc):
         self.value = value
@@ -183,6 +240,17 @@ class Del(Stmt):
 
     def __str__(self):
         return "del %s" % self.value
+
+
+class Raise(Stmt):
+    is_terminator = True
+
+    def __init__(self, exception, loc):
+        self.exception = exception
+        self.loc = loc
+
+    def __str__(self):
+        return "raise %s" % self.exception
 
 
 class Return(Stmt):
@@ -236,7 +304,7 @@ class Const(object):
         self.loc = loc
 
     def __repr__(self):
-        return 'const(%s, %s)' % (type(self.value), self.value)
+        return 'const(%s, %s)' % (type(self.value).__name__, self.value)
 
 
 class Global(object):
@@ -247,6 +315,25 @@ class Global(object):
 
     def __str__(self):
         return 'global(%s: %s)' % (self.name, self.value)
+
+
+class FreeVar(object):
+    """
+    A freevar, as loaded by LOAD_DECREF.
+    (i.e. a variable defined in an enclosing non-global scope)
+    """
+
+    def __init__(self, index, name, value, loc):
+        # index inside __code__.co_freevars
+        self.index = index
+        # variable name
+        self.name = name
+        # frozen value
+        self.value = value
+        self.loc = loc
+
+    def __str__(self):
+        return 'freevar(%s: %s)' % (self.name, self.value)
 
 
 class Var(object):
@@ -275,6 +362,24 @@ class Var(object):
     @property
     def is_temp(self):
         return self.name.startswith("$")
+
+
+class Intrinsic(object):
+    """
+    For inserting intrinsic node into the IR
+    """
+
+    def __init__(self, name, type, args):
+        self.name = name
+        self.type = type
+        self.loc = None
+        self.args = args
+
+    def __repr__(self):
+        return 'Intrinsic(%s, %s, %s)' % (self.name, self.type, self.loc)
+
+    def __str__(self):
+        return self.name
 
 
 class Scope(object):
@@ -378,7 +483,7 @@ class Block(object):
 
     def dump(self, file=sys.stdout):
         for inst in self.body:
-            print('  ', inst, file=file)
+            print('   ', inst, file=file)
 
     @property
     def terminator(self):

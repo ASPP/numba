@@ -1,10 +1,24 @@
 from __future__ import print_function, division, absolute_import
+
 import collections
 import functools
+import io
 import timeit
 import math
+import sys
+try:
+    import builtins
+except ImportError:
+    import __builtin__ as builtins
+
 import numpy
-from numba.config import PYVERSION
+
+from numba.config import PYVERSION, MACHINE_BITS
+
+
+INT_TYPES = (int,)
+if PYVERSION < (3, 0):
+    INT_TYPES += (long,)
 
 
 class ConfigOptions(object):
@@ -36,10 +50,20 @@ class ConfigOptions(object):
         copy._enabled = set(self._enabled)
         return copy
 
+    def __eq__(self, other):
+        return isinstance(other, ConfigOptions) and other._enabled == self._enabled
+
+    def __ne__(self, other):
+        return not self == other
+
+    def __hash__(self):
+        return hash(tuple(sorted(self._enabled)))
+
 
 class SortedMap(collections.Mapping):
     """Immutable
     """
+
     def __init__(self, seq):
         self._values = []
         self._index = {}
@@ -104,12 +128,16 @@ def runonce(fn):
             inner._result = res
             inner._ran = True
         return inner._result
+
     inner._ran = False
     return inner
 
 
 def bit_length(intval):
-    assert isinstance(intval, int)
+    """
+    Return the number of bits necessary to represent integer `intval`.
+    """
+    assert isinstance(intval, INT_TYPES)
     return len(bin(abs(intval))) - 2
 
 
@@ -149,13 +177,18 @@ def benchmark(func, maxsec=1):
     best = min(result) / number
     if best >= maxsec:
         return BenchmarkResult(func, result, number)
-    # Scale it up to make it close the maximum time
+        # Scale it up to make it close the maximum time
     max_per_run_time = maxsec / 3 / number
     number = max(max_per_run_time / best / 3, 1)
     # Round to the next power of 10
     number = int(10 ** math.ceil(math.log10(number)))
     records = timer.repeat(3, number)
     return BenchmarkResult(func, records, number)
+
+
+RANGE_ITER_OBJECTS = (builtins.range,)
+if PYVERSION < (3, 0):
+    RANGE_ITER_OBJECTS += (builtins.xrange,)
 
 
 # Other common python2/3 adaptors
@@ -182,10 +215,15 @@ if IS_PY3:
     def func_globals(f):
         return f.__globals__
 
-    def longint(v):
-        return int(v)
+    longint = int
+
+    unicode = str
+
+    StringIO = io.StringIO
 
 else:
+    from cStringIO import StringIO
+
     def dict_iteritems(d):
         return d.iteritems()
 
@@ -204,5 +242,116 @@ else:
     def func_globals(f):
         return f.func_globals
 
-    def longint(v):
-        return long(v)
+    longint = long
+
+    unicode = unicode
+
+
+# Backported from Python 3.4
+
+def _not_op(op, other):
+    # "not a < b" handles "a >= b"
+    # "not a <= b" handles "a > b"
+    # "not a >= b" handles "a < b"
+    # "not a > b" handles "a <= b"
+    op_result = op(other)
+    if op_result is NotImplemented:
+        return NotImplemented
+    return not op_result
+
+
+def _op_or_eq(op, self, other):
+    # "a < b or a == b" handles "a <= b"
+    # "a > b or a == b" handles "a >= b"
+    op_result = op(other)
+    if op_result is NotImplemented:
+        return NotImplemented
+    return op_result or self == other
+
+
+def _not_op_and_not_eq(op, self, other):
+    # "not (a < b or a == b)" handles "a > b"
+    # "not a < b and a != b" is equivalent
+    # "not (a > b or a == b)" handles "a < b"
+    # "not a > b and a != b" is equivalent
+    op_result = op(other)
+    if op_result is NotImplemented:
+        return NotImplemented
+    return not op_result and self != other
+
+
+def _not_op_or_eq(op, self, other):
+    # "not a <= b or a == b" handles "a >= b"
+    # "not a >= b or a == b" handles "a <= b"
+    op_result = op(other)
+    if op_result is NotImplemented:
+        return NotImplemented
+    return not op_result or self == other
+
+
+def _op_and_not_eq(op, self, other):
+    # "a <= b and not a == b" handles "a < b"
+    # "a >= b and not a == b" handles "a > b"
+    op_result = op(other)
+    if op_result is NotImplemented:
+        return NotImplemented
+    return op_result and self != other
+
+
+def _is_inherited_from_object(cls, op):
+    """
+    Whether operator *op* on *cls* is inherited from the root object type.
+    """
+    if PYVERSION >= (3,):
+        object_op = getattr(object, op)
+        cls_op = getattr(cls, op)
+        return object_op is cls_op
+    else:
+        # In 2.x, the inherited operator gets a new descriptor, so identity
+        # doesn't work.  OTOH, dir() doesn't list methods inherited from
+        # object (which it does in 3.x).
+        return op not in dir(cls)
+
+
+def total_ordering(cls):
+    """Class decorator that fills in missing ordering methods"""
+    convert = {
+        '__lt__': [('__gt__',
+                    lambda self, other: _not_op_and_not_eq(self.__lt__, self,
+                                                           other)),
+                   ('__le__',
+                    lambda self, other: _op_or_eq(self.__lt__, self, other)),
+                   ('__ge__', lambda self, other: _not_op(self.__lt__, other))],
+        '__le__': [('__ge__',
+                    lambda self, other: _not_op_or_eq(self.__le__, self,
+                                                      other)),
+                   ('__lt__',
+                    lambda self, other: _op_and_not_eq(self.__le__, self,
+                                                       other)),
+                   ('__gt__', lambda self, other: _not_op(self.__le__, other))],
+        '__gt__': [('__lt__',
+                    lambda self, other: _not_op_and_not_eq(self.__gt__, self,
+                                                           other)),
+                   ('__ge__',
+                    lambda self, other: _op_or_eq(self.__gt__, self, other)),
+                   ('__le__', lambda self, other: _not_op(self.__gt__, other))],
+        '__ge__': [('__le__',
+                    lambda self, other: _not_op_or_eq(self.__ge__, self,
+                                                      other)),
+                   ('__gt__',
+                    lambda self, other: _op_and_not_eq(self.__ge__, self,
+                                                       other)),
+                   ('__lt__', lambda self, other: _not_op(self.__ge__, other))]
+    }
+    # Find user-defined comparisons (not those inherited from object).
+    roots = [op for op in convert if not _is_inherited_from_object(cls, op)]
+    if not roots:
+        raise ValueError(
+            'must define at least one ordering operation: < > <= >=')
+    root = max(roots)       # prefer __lt__ to __le__ to __gt__ to __ge__
+    for opname, opfunc in convert[root]:
+        if opname not in roots:
+            opfunc.__name__ = opname
+            opfunc.__doc__ = getattr(int, opname).__doc__
+            setattr(cls, opname, opfunc)
+    return cls

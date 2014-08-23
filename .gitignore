@@ -1,0 +1,16 @@
+*.pyc
+*.o
+*.so
+*.dylib
+*.pyd
+*.pdb
+.coverage
+build/
+docs/_build/
+docs/source/modules/
+dist/
+htmlcov/
+*.egg-info
+*.sw[po]
+.idea/
+tags

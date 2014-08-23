@@ -10,6 +10,7 @@ import llvm.core as lc
 import llvm.ee as le
 import llvm.passes as lp
 
+from numba import cgutils
 from numba.utils import IS_PY3
 from . import llvm_types as lt
 from .decorators import registry as export_registry
@@ -56,6 +57,42 @@ find_args = functools.partial(get_configs, 1)
 find_shared_ending = functools.partial(get_configs, 2)
 
 
+def get_header():
+    import numpy
+    import textwrap
+
+    return textwrap.dedent("""\
+    #include <stdint.h>
+
+    #ifndef HAVE_LONGDOUBLE
+        #define HAVE_LONGDOUBLE %d
+    #endif
+
+    typedef struct {
+        float real;
+        float imag;
+    } complex64;
+
+    typedef struct {
+        double real;
+        double imag;
+    } complex128;
+
+    #if HAVE_LONGDOUBLE
+    typedef struct {
+        long double real;
+        long double imag;
+    } complex256;
+    #endif
+
+    typedef float float32;
+    typedef double float64;
+    #if HAVE_LONGDOUBLE
+    typedef long double float128;
+    #endif
+    """ % hasattr(numpy, 'complex256'))
+
+
 class _Compiler(object):
     """A base class to compile Python modules to a single shared library or
     extension module.
@@ -84,6 +121,12 @@ class _Compiler(object):
         self.inputs = inputs
         self.module_name = module_name
         self.export_python_wrap = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, type, value, traceback):
+        del self.exported_signatures[:]
 
     def _emit_python_wrapper(self, llvm_module):
         """Emit generated Python wrapper and extension module code.
@@ -140,8 +183,6 @@ class _Compiler(object):
         if self.export_python_wrap:
             self._emit_python_wrapper(llvm_module)
 
-        del self.exported_signatures[:]
-        print(llvm_module)
         return llvm_module
 
     def _process_inputs(self, wrap=False, **kws):
@@ -168,23 +209,21 @@ class _Compiler(object):
 
     def emit_type(self, tyobj):
         ret_val = str(tyobj)
-        if hasattr(tyobj, 'kind') and tyobj.kind == 'int':
+        if 'int' in ret_val:
             if ret_val.endswith(('8', '16', '32', '64')):
                 ret_val += "_t"
         return ret_val
 
     def emit_header(self, output):
-        from numba.minivect import minitypes
-
         fname, ext = os.path.splitext(output)
         with open(fname + '.h', 'w') as fout:
-            fout.write(minitypes.get_utility())
+            fout.write(get_header())
             fout.write("\n/* Prototypes */\n")
-            for signature in self.exported_signatures.values():
-                name = signature.name
-                restype = self.emit_type(signature.return_type)
+            for export_entry in export_registry:
+                name = export_entry.symbol
+                restype = self.emit_type(export_entry.signature.return_type)
                 args = ", ".join(self.emit_type(argtype)
-                                 for argtype in signature.args)
+                                 for argtype in export_entry.signature.args)
                 fout.write("extern %s %s(%s);\n" % (restype, name, args))
 
     def _emit_method_array(self, llvm_module):
@@ -224,11 +263,11 @@ class CompilerPy2(_Compiler):
     def module_create_definition(self):
         """Return the signature and name of the function to initialize the module.
         """
-        signature = lc.Type.function(lt._pyobject_head_struct_p,
+        signature = lc.Type.function(lt._pyobject_head_p,
                                      (lt._int8_star,
                                       self.method_def_ptr,
                                       lt._int8_star,
-                                      lt._pyobject_head_struct_p,
+                                      lt._pyobject_head_p,
                                       lt._int32))
 
         name = "Py_InitModule4"
@@ -267,7 +306,7 @@ class CompilerPy2(_Compiler):
                            (lc.Constant.gep(mod_name_const, [ZERO, ZERO]),
                             self._emit_method_array(llvm_module),
                             NULL,
-                            lc.Constant.null(lt._pyobject_head_struct_p),
+                            lc.Constant.null(lt._pyobject_head_p),
                             lc.Constant.int(lt._int32, sys.api_version)))
 
         builder.ret_void()
@@ -279,15 +318,15 @@ class CompilerPy3(_Compiler):
 
     #: typedef int (*visitproc)(PyObject *, void *);
     visitproc_ty = _ptr_fun(lt._int8,
-                            lt._pyobject_head_struct_p)
+                            lt._pyobject_head_p)
 
     #: typedef int (*inquiry)(PyObject *);
     inquiry_ty = _ptr_fun(lt._int8,
-                          lt._pyobject_head_struct_p)
+                          lt._pyobject_head_p)
 
     #: typedef int (*traverseproc)(PyObject *, visitproc, void *);
     traverseproc_ty = _ptr_fun(lt._int8,
-                               lt._pyobject_head_struct_p,
+                               lt._pyobject_head_p,
                                visitproc_ty,
                                lt._void_star)
 
@@ -306,11 +345,10 @@ class CompilerPy3(_Compiler):
     #:   Py_ssize_t m_index;
     #:   PyObject* m_copy;
     #: } PyModuleDef_Base;
-    module_def_base_ty = lc.Type.struct((lt._pyobject_head_struct_p,
-                                         lt._void_star,
+    module_def_base_ty = lc.Type.struct((lt._pyobject_head,
                                          m_init_ty,
                                          lt._llvm_py_ssize_t,
-                                         lt._pyobject_head_struct_p))
+                                         lt._pyobject_head_p))
 
     #: This struct holds all information that is needed to create a module object.
     #: typedef struct PyModuleDef{
@@ -338,11 +376,13 @@ class CompilerPy3(_Compiler):
     def module_create_definition(self):
         """Return the signature and name of the function to initialize the module
         """
-        signature = lc.Type.function(lt._pyobject_head_struct_p,
+        signature = lc.Type.function(lt._pyobject_head_p,
                                      (lc.Type.pointer(self.module_def_ty),
                                       lt._int32))
 
         name = "PyModule_Create2"
+        if lt._trace_refs_:
+            name += "TraceRefs"
 
         return signature, name
 
@@ -350,7 +390,7 @@ class CompilerPy3(_Compiler):
     def module_init_definition(self):
         """Return the name and signature of the module
         """
-        signature = lc.Type.function(lt._pyobject_head_struct_p, ())
+        signature = lc.Type.function(lt._pyobject_head_p, ())
 
         return signature, "PyInit_" + self.module_name
 
@@ -368,11 +408,10 @@ class CompilerPy3(_Compiler):
         mod_name_const.linkage = lc.LINKAGE_INTERNAL
 
         mod_def_base_init = lc.Constant.struct(
-            (lc.Constant.null(lt._pyobject_head_struct_p),  # PyObject_HEAD
-             lc.Constant.null(lt._void_star),               # PyObject_HEAD
+            (lt._pyobject_head_init,                        # PyObject_HEAD
              lc.Constant.null(self.m_init_ty),              # m_init
              lc.Constant.null(lt._llvm_py_ssize_t),         # m_index
-             lc.Constant.null(lt._pyobject_head_struct_p),  # m_copy
+             lc.Constant.null(lt._pyobject_head_p),         # m_copy
             )
         )
         mod_def_base = llvm_module.add_global_variable(mod_def_base_init.type, '.module_def_base')
@@ -405,14 +444,12 @@ class CompilerPy3(_Compiler):
                            (mod_def,
                             lc.Constant.int(lt._int32, sys.api_version)))
 
-        # Test if module has been created correctly
-        cond_true = mod_init_fn.append_basic_block("cond_true")
-        cond_false = mod_init_fn.append_basic_block("cond_false")
-        builder.cbranch(builder.icmp(lc.IPRED_EQ, mod, NULL), cond_true, cond_false)
-        builder.position_at_end(cond_true)
-        builder.ret(NULL)
+        # Test if module has been created correctly.
+        # (XXX for some reason comparing with the NULL constant fails llvm
+        #  with an assertion in pydebug mode)
+        with cgutils.ifthen(builder, cgutils.is_null(builder, mod)):
+            builder.ret(NULL)
 
-        builder.position_at_end(cond_false)
         builder.ret(mod)
 
 
