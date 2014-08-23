@@ -53,7 +53,7 @@ def _sentry_llvm_version():
 
     # Only look at the the major, minor and bugfix version numbers.
     # Ignore other stuffs
-    regex = re.compile(r'(\d+)\.(\d+).(\d+)')
+    regex = re.compile(r'(?:tag: )?(\d+)\.(\d+).(\d+)')
     m = regex.match(llvm.__version__)
     if m:
         ver = tuple(map(int, m.groups()))
