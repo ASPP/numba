@@ -12,3 +12,6 @@ export PYBUILD_NAME=numba
 override_dh_auto_install:
 	dh_auto_install
 	dh_numpy
+
+override_dh_auto_test:
+	cd .pybuild/pythonX.Y_2.7/build; python2.7 -c 'import numba; numba.test()'
